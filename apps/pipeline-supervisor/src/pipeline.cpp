@@ -64,8 +64,14 @@ std::string short_id() {
 }
 
 struct ProbeCtx {
-    std::string           camera_id;
-    NatsPublisher*        nats;
+    // Indexed by NvDsFrameMeta.source_id (the nvstreammux input pad
+    // index). Single entry today — one camera per worker — but the
+    // map exists so a future batched-mux group can mount N cameras
+    // behind one probe without re-plumbing every call site.
+    // primaryCameraId() returns sources[0] for the existing log /
+    // bus-publish paths that summarise across the worker.
+    std::vector<std::string> sources;
+    NatsPublisher*           nats;
     // Snapshot of the effective mute set, resolved at worker startup.
     // The probe short-circuits on empty so unmuted cameras pay zero.
     std::set<std::string> muted_classes;
@@ -88,6 +94,22 @@ struct ProbeCtx {
     std::uint64_t         hb_frames_obj  = 0;
     std::uint64_t         hb_objects     = 0;
     std::uint64_t         hb_published   = 0;
+
+    // Per-frame source_id → camera_id lookup. Falls back to
+    // sources[0] if the index is out of range (defensive — if
+    // nvstreammux ever sends an unexpected source_id we'd rather
+    // mislabel than crash).
+    const std::string& cameraIdFor(unsigned source_id) const {
+        if (source_id < sources.size()) return sources[source_id];
+        static const std::string empty;
+        return sources.empty() ? empty : sources[0];
+    }
+    // For log lines + bus publishes that summarise across the
+    // worker (heartbeats, etc.). Today there's only ever one source.
+    const std::string& primaryCameraId() const {
+        static const std::string empty;
+        return sources.empty() ? empty : sources[0];
+    }
 };
 
 // JSON-escape minimal — only the fields we emit. Labels are small ASCII, IDs
@@ -472,7 +494,7 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
     if (!batch) {
         ctx->hb_batch_null++;
         if ((ctx->hb_buffers % 250) == 0) {
-            std::cerr << "probe[" << ctx->camera_id << "]: buffers="
+            std::cerr << "probe[" << ctx->primaryCameraId() << "]: buffers="
                       << ctx->hb_buffers << " batch_null=" << ctx->hb_batch_null
                       << " (no NvDsBatchMeta on pad)\n";
         }
@@ -502,6 +524,11 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
         if (!frame) continue;
         const int W = frame->source_frame_width  ? frame->source_frame_width  : 1920;
         const int H = frame->source_frame_height ? frame->source_frame_height : 1080;
+        // Per-frame camera identity. Today there is one source per
+        // worker so this resolves to ctx->sources[0]; once batched-mux
+        // groups land it picks the right id from the per-frame
+        // source_id without touching the rest of the loop.
+        const std::string& cam_id = ctx->cameraIdFor(frame->source_id);
         bool frame_had_obj = false;
 
         for (NvDsMetaList* ol = frame->obj_meta_list; ol; ol = ol->next) {
@@ -581,7 +608,7 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             std::ostringstream js;
             js << "{"
                << "\"id\":\""         << det_id               << "\","
-               << "\"camera_id\":\""  << json_escape(ctx->camera_id) << "\","
+               << "\"camera_id\":\""  << json_escape(cam_id) << "\","
                << "\"ts\":\""         << iso                  << "\","
                << "\"class_name\":\"" << json_escape(label)   << "\","
                << "\"kind\":\""       << kind                 << "\","
@@ -612,7 +639,7 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
             }
             js << "}";
             std::string payload = js.str();
-            std::string subj = std::string("fnvr.events.detection.") + ctx->camera_id;
+            std::string subj = std::string("fnvr.events.detection.") + cam_id;
             if (ctx->nats && ctx->nats->Publish(subj, payload)) {
                 ctx->hb_published++;
             }
@@ -620,7 +647,7 @@ GstPadProbeReturn InferSrcProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
         if (frame_had_obj) ctx->hb_frames_obj++;
     }
     if ((ctx->hb_buffers % 250) == 0) {
-        std::cerr << "probe[" << ctx->camera_id << "]: buffers=" << ctx->hb_buffers
+        std::cerr << "probe[" << ctx->primaryCameraId() << "]: buffers=" << ctx->hb_buffers
                   << " batch_null=" << ctx->hb_batch_null
                   << " frames_with_obj=" << ctx->hb_frames_obj
                   << " objects=" << ctx->hb_objects
@@ -1196,7 +1223,10 @@ p << "rtspsrc location=" << url
                 // Leaked on purpose: lifetime matches the pipeline, cleaned up
                 // when the process exits. Fine for M2, tighten when we have
                 // multi-pipeline lifecycle.
-                auto* ctx = new ProbeCtx{cam_.id, nats_, cam_.muted_classes};
+                auto* ctx = new ProbeCtx;
+                ctx->sources       = {cam_.id};
+                ctx->nats          = nats_;
+                ctx->muted_classes = cam_.muted_classes;
                 // When face_id is on the probe also writes a JPEG
                 // crop of each face using NvBufSurfTransform on the
                 // same NVMM buffer the detection came from — zero

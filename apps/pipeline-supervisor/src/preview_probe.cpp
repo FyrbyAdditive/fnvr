@@ -9,6 +9,7 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <sys/stat.h>
 
@@ -45,7 +46,11 @@ constexpr auto kInterval = std::chrono::milliseconds(1000);
 }  // namespace
 
 struct PreviewProbeCtx {
-    std::string camera_id;
+    // Indexed by NvDsFrameMeta.source_id (the nvstreammux input pad
+    // index). Single entry today — one camera per worker — but the
+    // map exists so a future batched-mux group can mount N cameras
+    // behind one probe and emit one JPEG ring per source.
+    std::vector<std::string> sources;
     std::string live_dir;
     int         source_width  = 0;
     int         source_height = 0;
@@ -57,13 +62,23 @@ struct PreviewProbeCtx {
 #if FNVR_HAS_DEEPSTREAM
     NvBufSurface* dst_surf = nullptr;
 #endif
+
+    const std::string& cameraIdFor(unsigned source_id) const {
+        if (source_id < sources.size()) return sources[source_id];
+        static const std::string empty;
+        return sources.empty() ? empty : sources[0];
+    }
+    const std::string& primaryCameraId() const {
+        static const std::string empty;
+        return sources.empty() ? empty : sources[0];
+    }
 };
 
 PreviewProbeCtx* preview_probe_ctx_new(std::string camera_id,
                                        std::string live_dir,
                                        int src_w, int src_h) {
     auto* ctx = new PreviewProbeCtx;
-    ctx->camera_id     = std::move(camera_id);
+    ctx->sources       = {std::move(camera_id)};
     ctx->live_dir      = std::move(live_dir);
     ctx->source_width  = src_w  > 0 ? src_w  : 1920;
     ctx->source_height = src_h > 0 ? src_h : 1080;
@@ -103,7 +118,7 @@ bool ensureDstSurface(PreviewProbeCtx* ctx, NvBufSurface* in_surf) {
     ap.params.memType      = NVBUF_MEM_SURFACE_ARRAY;
     ap.memtag              = NvBufSurfaceTag_VIDEO_CONVERT;
     if (NvBufSurfaceAllocate(&ctx->dst_surf, 1, &ap) != 0 || !ctx->dst_surf) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << ctx->primaryCameraId()
                   << "]: NvBufSurfaceAllocate failed\n";
         ctx->dst_surf = nullptr;
         return false;
@@ -117,7 +132,7 @@ bool ensureDstSurface(PreviewProbeCtx* ctx, NvBufSurface* in_surf) {
 bool writeRingEntry(PreviewProbeCtx* ctx) {
     NvBufSurfaceParams& dp = ctx->dst_surf->surfaceList[0];
     if (NvBufSurfaceMap(ctx->dst_surf, 0, 0, NVBUF_MAP_READ) != 0) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << ctx->primaryCameraId()
                   << "]: NvBufSurfaceMap failed\n";
         return false;
     }
@@ -131,23 +146,23 @@ bool writeRingEntry(PreviewProbeCtx* ctx) {
     char tmp_path[512];
     char out_path[512];
     std::snprintf(tmp_path, sizeof(tmp_path), "%s/%s.%d.jpg.tmp",
-                  ctx->live_dir.c_str(), ctx->camera_id.c_str(), ctx->ring_idx);
+                  ctx->live_dir.c_str(), ctx->primaryCameraId().c_str(), ctx->ring_idx);
     std::snprintf(out_path, sizeof(out_path), "%s/%s.%d.jpg",
-                  ctx->live_dir.c_str(), ctx->camera_id.c_str(), ctx->ring_idx);
+                  ctx->live_dir.c_str(), ctx->primaryCameraId().c_str(), ctx->ring_idx);
 
     bool ok = encodeJpegRGBA(rgba, stride, 0, 0, kOutW, kOutH, kQuality,
                              tmp_path);
     NvBufSurfaceUnMap(ctx->dst_surf, 0, 0);
 
     if (!ok) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << ctx->primaryCameraId()
                   << "]: encodeJpegRGBA failed\n";
         std::remove(tmp_path);
         return false;
     }
 
     if (std::rename(tmp_path, out_path) != 0) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << ctx->primaryCameraId()
                   << "]: rename(" << tmp_path << " -> " << out_path
                   << ") failed: " << std::strerror(errno) << "\n";
         std::remove(tmp_path);
@@ -234,7 +249,7 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
 
     if (NvBufSurfTransform(&tmp_in, ctx->dst_surf, &tp)
         != NvBufSurfTransformError_Success) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << ctx->primaryCameraId()
                   << "]: NvBufSurfTransform failed\n";
         gst_buffer_unmap(buf, &map);
         return GST_PAD_PROBE_OK;
@@ -247,7 +262,7 @@ GstPadProbeReturn PreviewSnapshotProbe(GstPad*, GstPadProbeInfo* info,
     // can confirm the probe is engaged; silent thereafter.
     static std::atomic<int> first_ok{0};
     if (ok && first_ok.exchange(1) == 0) {
-        std::cerr << "preview_probe[" << ctx->camera_id
+        std::cerr << "preview_probe[" << ctx->primaryCameraId()
                   << "]: first JPEG ring entry written\n";
     }
 

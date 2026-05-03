@@ -26,6 +26,7 @@
 
 #include "config.h"
 #include "db_reconciler.h"
+#include "dynamic_pads.h"
 #include "nats_publisher.h"
 #include "pipeline.h"
 #include "supervisor.h"
@@ -46,6 +47,108 @@ int main(int argc, char** argv) {
         if (!nats.Connected()) return 1;
         bool ok = nats.Publish(argv[2], argv[3], /*flush=*/true);
         return ok ? 0 : 2;
+    }
+
+    // Dynamic-pad smoke test (stage 2a verification). Builds an
+    // nvstreammux + fakesink pipeline with one initial source, sets
+    // PLAYING, then exercises AddSourceToMux + RemoveSourceFromMux
+    // a couple of times. Prints OK / FAILED at each step. Invoked as:
+    //   pipeline-supervisor --test-dynamic-pads
+    // Exit 0 = all steps OK, non-zero = at least one step failed.
+    if (argc >= 2 && std::string(argv[1]) == "--test-dynamic-pads") {
+        gst_init(nullptr, nullptr);
+        const std::string desc =
+            "videotestsrc is-live=true pattern=ball ! "
+            "video/x-raw,width=320,height=240,framerate=30/1 ! "
+            "nvvideoconvert ! "
+            "video/x-raw(memory:NVMM),format=NV12,width=320,height=240 ! "
+            "nvstreammux name=mux batch-size=4 width=320 height=240 "
+            "  live-source=1 batched-push-timeout=40000 ! "
+            "fakesink sync=false async=false";
+        GError* err = nullptr;
+        GstElement* p = gst_parse_launch(desc.c_str(), &err);
+        if (!p) {
+            std::cerr << "test: parse failed: "
+                      << (err ? err->message : "?") << "\n";
+            if (err) g_error_free(err);
+            return 1;
+        }
+        // Initial source is parsed inline + linked to mux.sink_0
+        // automatically by gst_parse_launch's auto-linker.
+        if (gst_element_set_state(p, GST_STATE_PLAYING) ==
+            GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "test: initial PLAYING failed\n";
+            gst_object_unref(p);
+            return 2;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::cerr << "test: initial pipeline rolled to PLAYING — OK\n";
+
+        GstElement* mux = gst_bin_get_by_name(GST_BIN(p), "mux");
+        if (!mux) {
+            std::cerr << "test: get_by_name(mux) failed\n";
+            gst_element_set_state(p, GST_STATE_NULL);
+            gst_object_unref(p);
+            return 3;
+        }
+
+        // Step 1: add a second source. Caps filter is in raw form
+        // because gst-launch syntax doesn't tolerate (memory:NVMM)
+        // inside parse_bin_from_description (the parens conflict
+        // with bin-grouping). The trailing nvvideoconvert produces
+        // NVMM on its src pad either way.
+        const std::string src2 =
+            "videotestsrc is-live=true pattern=snow ! "
+            "video/x-raw,width=320,height=240,framerate=30/1 ! "
+            "nvvideoconvert";
+        auto* added2 = fnvr::AddSourceToMux(p, mux, src2, "snow");
+        if (!added2) {
+            std::cerr << "test: AddSourceToMux(snow) FAILED\n";
+            gst_element_set_state(p, GST_STATE_NULL);
+            gst_object_unref(mux);
+            gst_object_unref(p);
+            return 4;
+        }
+        std::cerr << "test: added snow source as source_id="
+                  << added2->source_id << " — OK\n";
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        // Step 2: remove it.
+        if (!fnvr::RemoveSourceFromMux(p, mux, added2)) {
+            std::cerr << "test: RemoveSourceFromMux(snow) reported errors\n";
+        } else {
+            std::cerr << "test: removed snow source — OK\n";
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        // Step 3: add a different source, then remove it.
+        const std::string src3 =
+            "videotestsrc is-live=true pattern=smpte ! "
+            "video/x-raw,width=320,height=240,framerate=30/1 ! "
+            "nvvideoconvert";
+        auto* added3 = fnvr::AddSourceToMux(p, mux, src3, "smpte");
+        if (!added3) {
+            std::cerr << "test: AddSourceToMux(smpte) FAILED\n";
+            gst_element_set_state(p, GST_STATE_NULL);
+            gst_object_unref(mux);
+            gst_object_unref(p);
+            return 5;
+        }
+        std::cerr << "test: added smpte source as source_id="
+                  << added3->source_id << " — OK\n";
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        if (!fnvr::RemoveSourceFromMux(p, mux, added3)) {
+            std::cerr << "test: RemoveSourceFromMux(smpte) reported errors\n";
+        } else {
+            std::cerr << "test: removed smpte source — OK\n";
+        }
+
+        gst_element_set_state(p, GST_STATE_NULL);
+        gst_object_unref(mux);
+        gst_object_unref(p);
+        std::cerr << "test: all steps complete — pipeline torn down OK\n";
+        return 0;
     }
 
     // Worker mode: one subprocess per camera. Isolates splitmuxsink / nvinfer

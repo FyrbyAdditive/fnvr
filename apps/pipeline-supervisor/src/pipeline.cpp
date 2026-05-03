@@ -1130,6 +1130,26 @@ p << "rtspsrc location=" << url
     const bool skip_inference_probe = cam_.enabled_detectors.size() == 1 &&
                                        cam_.enabled_detectors[0] == "none";
 
+    // Data-flow watchdog counter — pad probe on pgie.src bumps
+    // buffersPassed_ for every batch buffer that flows. Sampled by
+    // the flow_watchdog thread in main.cpp every 5 s; if the count
+    // hasn't advanced in 20 s while Playing()=true, the worker is
+    // wedged inside an NvMedia/VIC syscall the bus won't surface.
+    // No-op when skip_inference is on (no pgie element).
+    if (!skip_inference_probe) {
+        GstElement* pgie_elem = gst_bin_get_by_name(GST_BIN(pipeline), "pgie");
+        if (pgie_elem) {
+            GstPad* src = gst_element_get_static_pad(pgie_elem, "src");
+            if (src) {
+                gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER,
+                                  &SingleCameraPipeline::FlowCounterProbe,
+                                  this, nullptr);
+                gst_object_unref(src);
+            }
+            gst_object_unref(pgie_elem);
+        }
+    }
+
     // For the hailo backend the `pgie` element is a no-op queue. Install
     // the Hailo inference probe on its src pad so libhailort runs between
     // nvstreammux and nvtracker, injecting NvDsObjectMeta into the frame
@@ -1321,6 +1341,13 @@ void SetWorkerStartupGraceSec(int sec) { g_worker_startup_grace_sec = sec; }
                   << "s), not publishing failed\n";
     }
     std::_Exit(3);
+}
+
+GstPadProbeReturn SingleCameraPipeline::FlowCounterProbe(
+    GstPad*, GstPadProbeInfo*, gpointer user_data) {
+    auto* self = static_cast<SingleCameraPipeline*>(user_data);
+    if (self) self->buffersPassed_.fetch_add(1, std::memory_order_relaxed);
+    return GST_PAD_PROBE_OK;
 }
 
 gboolean SingleCameraPipeline::BusHandler(GstBus*, GstMessage* msg, gpointer user_data) {

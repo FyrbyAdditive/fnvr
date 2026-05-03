@@ -39,6 +39,11 @@ public:
 private:
     GstElement* BuildPipeline();
     static gboolean BusHandler(GstBus*, GstMessage*, gpointer user_data);
+    // Pad-probe callback that bumps buffersPassed_ on every batch
+    // buffer flowing past pgie.src. user_data points at the
+    // SingleCameraPipeline so the probe can update the atomic.
+    // The data-flow watchdog samples this counter every 5s.
+    static GstPadProbeReturn FlowCounterProbe(GstPad*, GstPadProbeInfo*, gpointer);
 
     CameraConfig     cam_;
     std::string      recordings_dir_;

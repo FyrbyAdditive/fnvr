@@ -2,9 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <mutex>
-#include <condition_variable>
+#include <thread>
 
 namespace fnvr {
 
@@ -47,45 +48,65 @@ bool syncToParent(GstElement* el) {
     return waitForState(el, GST_STATE_PLAYING);
 }
 
-// Per-removal state for the BLOCK-DOWNSTREAM probe. The probe fires
-// on the streaming thread; we use a condvar to wake the caller on
-// the main thread when the block is established and we've finished
-// unlink + release. Non-RAII because GStreamer probes have specific
-// removal semantics.
+// Per-removal probe state. Probes fire on a streaming thread (or a
+// GStreamer internal thread for IDLE probes); the main thread waits
+// on the condvar before doing the synchronous unlink + bin_remove
+// sequence. The probe itself just signals — putting bin_remove in
+// the probe sometimes raced with GStreamer's internal state
+// propagation and produced GST_IS_ELEMENT CRITICALs on later adds.
 struct RemovalCtx {
     std::mutex                 mu;
     std::condition_variable    cv;
-    bool                       done = false;
-    GstElement*                source_bin   = nullptr;
-    GstPad*                    source_src   = nullptr;
-    GstPad*                    mux_sink     = nullptr;
-    GstElement*                mux          = nullptr;
-    GstElement*                parent       = nullptr;
-    bool                       ok           = false;
+    bool                       fired = false;
 };
 
-GstPadProbeReturn removeBlockProbe(GstPad* pad,
-                                   GstPadProbeInfo* /*info*/,
-                                   gpointer user_data) {
+GstPadProbeReturn signalAndStayProbe(GstPad* /*pad*/,
+                                     GstPadProbeInfo* /*info*/,
+                                     gpointer user_data) {
     auto* ctx = static_cast<RemovalCtx*>(user_data);
-
-    // We're blocking the source's src pad — no more buffers will
-    // reach the mux from this source. The probe's job is minimal:
-    // just signal the main thread to do the actual unlink + remove
-    // safely under its own thread context. Trying to do bin_remove
-    // from a streaming thread (the probe's context) sometimes
-    // triggers the "GST_IS_ELEMENT" CRITICAL because GStreamer is
-    // mid-flight on internal state.
     {
         std::lock_guard<std::mutex> lock(ctx->mu);
-        ctx->ok = true;
-        ctx->done = true;
+        ctx->fired = true;
     }
     ctx->cv.notify_one();
-    // Don't return REMOVE here — leave the BLOCK probe in place
-    // until the main thread has finished its synchronous unlink +
-    // remove sequence. The pad stays blocked the whole time.
+    // Stay in place — the probe blocks the pad until removed by
+    // the caller. The IDLE variant is one-shot anyway.
     return GST_PAD_PROBE_OK;
+}
+
+// Try to send EOS to the mux's sink pad and wait briefly for the
+// mux to acknowledge by releasing the slot. nvstreammux logs
+// "Successfully handled EOS for source_id=N" when it does. We
+// don't directly observe that log line here — instead we just
+// give the mux 1 s to process the EOS event before proceeding
+// to unlink. If the mux is wedged, unlink will still fail, but
+// at least we tried the canonical path first.
+bool sendEosToMux(GstPad* mux_sink) {
+    if (!mux_sink) return false;
+    gboolean sent = gst_pad_send_event(mux_sink, gst_event_new_eos());
+    if (!sent) {
+        std::cerr << "dynamic_pads: gst_pad_send_event(EOS) returned FALSE\n";
+        return false;
+    }
+    // Give the mux a beat to process the event before unlink.
+    // 200ms is enough at typical batched-push-timeout=40ms cycles.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    return true;
+}
+
+// Try to flush the link by sending FLUSH_START + FLUSH_STOP to the
+// mux sink pad. This forces the mux to release any stream lock it's
+// holding without acknowledging pending data. Works even when EOS
+// can't get through because the aggregator is wedged inside its
+// poll cycle.
+bool sendFlushToMux(GstPad* mux_sink) {
+    if (!mux_sink) return false;
+    bool start_ok = gst_pad_send_event(mux_sink,
+        gst_event_new_flush_start()) == TRUE;
+    bool stop_ok  = gst_pad_send_event(mux_sink,
+        gst_event_new_flush_stop(TRUE)) == TRUE;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    return start_ok && stop_ok;
 }
 
 }  // namespace
@@ -131,33 +152,42 @@ AddedSource* AddSourceToMux(GstElement* parent,
         return nullptr;
     }
 
-    // Request a new sink pad on the mux. nvstreammux requires an
-    // explicit sink_N name (its template is sink_%u but its
-    // request handler doesn't auto-pick the next available index
-    // the way the generic GstElement handler does — DeepStream
-    // expects the caller to pick the index). We probe upward
-    // starting at 0 until one succeeds; numbers below the first
-    // success are already in use.
+    // Request a new sink pad on the mux. Two complications:
+    //
+    // 1. nvstreammux requires an explicit sink_N name (its
+    //    template is sink_%u but its request handler doesn't
+    //    auto-pick the next available index — DeepStream expects
+    //    the caller to pick).
+    // 2. RemoveSourceFromMux deliberately leaks request pads (see
+    //    the comment in that function — release_request_pad on
+    //    nvstreammux deadlocks). So sink_0 may already exist as a
+    //    leaked slot from a previous removal. Calling
+    //    request_pad_simple on an existing-but-leaked pad would
+    //    trip "Element mux already has a pad named sink_N" and
+    //    pthread_assert.
+    //
+    // We probe each sink_N: first ask whether a pad with that
+    // name already exists via gst_element_get_static_pad; if it
+    // does, that index is taken (active or leaked) and we move
+    // on. Only when the name is fresh do we call request_pad.
     GstPad* mux_sink = nullptr;
-    for (unsigned i = 0; i < 64 && !mux_sink; i++) {
+    int chosen_source_id = -1;
+    for (unsigned i = 0; i < 256 && !mux_sink; i++) {
         std::string n = "sink_" + std::to_string(i);
+        GstPad* existing = gst_element_get_static_pad(mux, n.c_str());
+        if (existing) {
+            gst_object_unref(existing);
+            continue;  // taken (either active or leaked)
+        }
         mux_sink = gst_element_request_pad_simple(mux, n.c_str());
+        if (mux_sink) chosen_source_id = static_cast<int>(i);
     }
     if (!mux_sink) {
-        std::cerr << "dynamic_pads: could not request a sink_N pad on mux\n";
+        std::cerr << "dynamic_pads: could not request a sink_N pad on mux "
+                     "(searched up to sink_255 — too many leaked slots? "
+                     "consider restarting the group)\n";
         gst_bin_remove(GST_BIN(parent), source_bin);
         return nullptr;
-    }
-    // nvstreammux may ignore the explicit "sink_<i>" name and return
-    // the next-free slot; read the actual pad name to learn the
-    // assigned source_id.
-    int chosen_source_id = -1;
-    {
-        gchar* pn = gst_pad_get_name(mux_sink);
-        if (pn) {
-            sscanf(pn, "sink_%d", &chosen_source_id);
-            g_free(pn);
-        }
     }
 
     // Get the bin's ghost src pad and link.
@@ -202,83 +232,161 @@ bool RemoveSourceFromMux(GstElement* parent,
                          GstElement* mux,
                          AddedSource* s) {
     if (!s) return true;
-    bool ok = true;
+    if (!parent || !mux || !s->source_src_pad || !s->mux_sink_pad ||
+        !s->source_bin) {
+        // Bad inputs — clean up what we can and bail.
+        if (s->source_src_pad) {
+            gst_object_unref(s->source_src_pad);
+            s->source_src_pad = nullptr;
+        }
+        delete s;
+        return false;
+    }
 
-    // The remove path uses a BLOCK-DOWNSTREAM probe to fence in-
-    // flight buffers, then does the actual unlink + bin_remove on
-    // THIS thread (the caller's thread, typically the main loop).
-    // Doing bin_remove from inside the probe (streaming thread)
-    // sometimes raced with GStreamer's internal state propagation
-    // and produced GST_IS_ELEMENT CRITICALs on the next add.
-    bool used_block_probe = false;
-    if (parent && mux && s->source_src_pad && s->mux_sink_pad &&
-        s->source_bin) {
+    // Layered fallback. Each phase tries to make the mux release
+    // its hold on this source so the synchronous unlink (run after
+    // the loop) is free of the STREAM_LOCK deadlock. Whichever
+    // phase succeeds wins; later ones never run.
+    enum class Phase { A_block, B_idle, C_flush, D_giveup };
+    Phase reached = Phase::D_giveup;
+    gulong probe_id = 0;
+    GstPad* probe_pad = nullptr;
+
+    // ---- Phase A: BLOCK probe on source's src pad ----
+    // Fences in-flight buffers (if any). If the source was
+    // actively flowing, the probe fires within ms and we send
+    // EOS to the mux sink pad. The mux logs "Successfully
+    // handled EOS for source_id=N" and releases its hold.
+    {
         RemovalCtx ctx;
-        ctx.parent      = parent;
-        ctx.mux         = mux;
-        ctx.source_bin  = s->source_bin;
-        ctx.source_src  = s->source_src_pad;
-        ctx.mux_sink    = s->mux_sink_pad;
-
-        gulong probe_id = gst_pad_add_probe(
+        gulong id = gst_pad_add_probe(
             s->source_src_pad,
             GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
-            &removeBlockProbe, &ctx, nullptr);
-
-        if (probe_id == 0) {
-            std::cerr << "dynamic_pads: gst_pad_add_probe(BLOCK) failed\n";
-            ok = false;
+            &signalAndStayProbe, &ctx, nullptr);
+        if (id != 0) {
+            std::unique_lock<std::mutex> lock(ctx.mu);
+            if (ctx.cv.wait_for(lock, std::chrono::seconds(1),
+                                [&]{ return ctx.fired; })) {
+                std::cerr << "dynamic_pads: phase A — BLOCK probe fired\n";
+                lock.unlock();
+                // Probe is blocking. Send EOS to the mux sink (UPSTREAM
+                // direction relative to the mux — gst_pad_send_event
+                // delivers events to the pad's element).
+                if (sendEosToMux(s->mux_sink_pad)) {
+                    reached = Phase::A_block;
+                }
+                // Remove the BLOCK probe so subsequent phases or the
+                // synchronous cleanup don't fight it.
+                gst_pad_remove_probe(s->source_src_pad, id);
+                id = 0;
+            } else {
+                std::cerr << "dynamic_pads: phase A — BLOCK probe did not fire "
+                             "in 1s (source idle), removing probe\n";
+                gst_pad_remove_probe(s->source_src_pad, id);
+                id = 0;
+            }
         } else {
-            // Wait briefly for the probe to fire (it just signals
-            // and stays in place). 2s is plenty under load; if it
-            // doesn't fire (source already silent), we proceed
-            // anyway — there's no buffer in flight to race with.
+            std::cerr << "dynamic_pads: phase A — failed to install BLOCK probe\n";
+        }
+        probe_id = id;  // 0 if removed
+    }
+
+    // ---- Phase B: IDLE probe on the mux's sink pad ----
+    // Fires when the aggregator visits this slot, even if no
+    // buffer is present. nvstreammux polls every cycle so this
+    // typically fires within batched-push-timeout (40ms).
+    if (reached == Phase::D_giveup) {
+        RemovalCtx ctx;
+        gulong id = gst_pad_add_probe(
+            s->mux_sink_pad,
+            GstPadProbeType(GST_PAD_PROBE_TYPE_IDLE),
+            &signalAndStayProbe, &ctx, nullptr);
+        if (id != 0) {
             std::unique_lock<std::mutex> lock(ctx.mu);
             if (ctx.cv.wait_for(lock, std::chrono::seconds(2),
-                                [&]{ return ctx.done; })) {
-                used_block_probe = true;
+                                [&]{ return ctx.fired; })) {
+                std::cerr << "dynamic_pads: phase B — IDLE probe fired on mux sink\n";
+                lock.unlock();
+                if (sendEosToMux(s->mux_sink_pad)) {
+                    reached = Phase::B_idle;
+                }
+                gst_pad_remove_probe(s->mux_sink_pad, id);
             } else {
-                std::cerr << "dynamic_pads: BLOCK probe didn't fire in 2s; "
-                             "proceeding without (source likely idle)\n";
+                std::cerr << "dynamic_pads: phase B — IDLE probe did not fire "
+                             "in 2s (mux aggregator wedged?), removing\n";
+                gst_pad_remove_probe(s->mux_sink_pad, id);
             }
-        }
-
-        // Synchronous cleanup. Probe (if any) is still blocking
-        // the src pad — remove it FIRST so EOS can travel
-        // downstream. Pushing EOS through a blocked pad would
-        // deadlock the caller.
-        if (probe_id != 0) {
-            gst_pad_remove_probe(s->source_src_pad, probe_id);
-        }
-        // EOS only when the source was actually flowing (probe
-        // fired). On an idle source nvstreammux gets confused by
-        // EOS-without-prior-buffers and the subsequent
-        // release_request_pad hangs. The unlink + bin_remove path
-        // below handles the idle case cleanly without EOS.
-        if (used_block_probe) {
-            gst_pad_push_event(s->source_src_pad, gst_event_new_eos());
-        }
-        if (!gst_pad_unlink(s->source_src_pad, s->mux_sink_pad)) {
-            std::cerr << "dynamic_pads: gst_pad_unlink failed\n";
-            ok = false;
-        }
-        // Roll the source bin to NULL BEFORE releasing the mux
-        // request pad — it gives the bin a clean shutdown without
-        // nvstreammux waiting on the dead source.
-        gst_element_set_state(s->source_bin, GST_STATE_NULL);
-        gst_element_release_request_pad(mux, s->mux_sink_pad);
-        gst_object_unref(s->mux_sink_pad);
-        s->mux_sink_pad = nullptr;
-        if (!gst_bin_remove(GST_BIN(parent), s->source_bin)) {
-            std::cerr << "dynamic_pads: gst_bin_remove failed\n";
-            ok = false;
+        } else {
+            std::cerr << "dynamic_pads: phase B — failed to install IDLE probe\n";
         }
     }
 
-    // gst_element_get_static_pad gave us a separate ref in
-    // AddSourceToMux; release it now. Safe even after the
-    // bin_remove inside the probe — pad object stays alive while
-    // anyone holds a ref to it.
+    // ---- Phase C: explicit flush event ----
+    // Forces the mux to release any stream lock it's holding,
+    // even if the aggregator is wedged. This is a reset that
+    // discards pending data, but no other data is flowing through
+    // this pad anyway.
+    if (reached == Phase::D_giveup) {
+        std::cerr << "dynamic_pads: phase C — flushing mux sink\n";
+        if (sendFlushToMux(s->mux_sink_pad)) {
+            reached = Phase::C_flush;
+        } else {
+            std::cerr << "dynamic_pads: phase C — flush failed\n";
+        }
+    }
+
+    // ---- Phase D: give up gracefully ----
+    if (reached == Phase::D_giveup) {
+        std::cerr << "dynamic_pads: phase D — could not coax mux to release; "
+                     "best-effort cleanup follows\n";
+    }
+
+    // Synchronous cleanup. Even if every phase failed, we still
+    // try unlink + bin_remove; phases A-C are about giving us the
+    // best chance of unlink succeeding without deadlock.
+    bool ok = (reached != Phase::D_giveup);
+    (void)probe_pad;
+    (void)probe_id;
+
+    if (!gst_pad_unlink(s->source_src_pad, s->mux_sink_pad)) {
+        std::cerr << "dynamic_pads: gst_pad_unlink failed\n";
+        ok = false;
+    }
+
+    // Set the source bin to NULL before further cleanup. Some
+    // elements emit one last buffer on state change; want that
+    // dropped against an unlinked pair, not active.
+    gst_element_set_state(s->source_bin, GST_STATE_NULL);
+
+    // We deliberately do NOT call gst_element_release_request_pad
+    // on nvstreammux. The bundled DeepStream 7.1 nvstreammux
+    // implementation blocks indefinitely on release for any slot
+    // (even slots whose source is fully drained — verified with
+    // EOS-on-sink-pad acknowledged via "Successfully handled EOS
+    // for source_id=N" before the release call). And calling
+    // release with a timeout + thread-detach corrupts internal
+    // state (next request returns the same numeric pad name and
+    // crashes with "Element mux already has a pad named sink_N").
+    //
+    // Instead: leak the request pad. AddSourceToMux's pad-search
+    // loop probes upward starting at sink_0, so it'll find the
+    // next genuinely-free slot regardless. Over the life of one
+    // pipeline process this leaks a few KB per source removal.
+    // For a Group running indefinitely with occasional source
+    // restarts, this is the price of avoiding the release_request_pad
+    // landmine. When the parent pipeline goes to NULL on group
+    // teardown, all internal state cleans up.
+    //
+    // Drop our ref to the mux_sink_pad — the mux still holds its
+    // own internal ref so the pad object survives.
+    gst_object_unref(s->mux_sink_pad);
+    s->mux_sink_pad = nullptr;
+
+    if (!gst_bin_remove(GST_BIN(parent), s->source_bin)) {
+        std::cerr << "dynamic_pads: gst_bin_remove failed\n";
+        ok = false;
+    }
+
     if (s->source_src_pad) {
         gst_object_unref(s->source_src_pad);
         s->source_src_pad = nullptr;

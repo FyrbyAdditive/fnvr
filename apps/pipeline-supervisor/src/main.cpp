@@ -143,6 +143,64 @@ int main(int argc, char** argv) {
         } else {
             std::cerr << "test: removed smpte source — OK\n";
         }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        // Step 4: idle source — add a source then immediately
+        // force its bin to NULL externally (simulating a wedged
+        // source whose buffers stop). Then remove it. Phase A's
+        // BLOCK probe should NOT fire (no buffers in flight);
+        // Phase B's IDLE probe on mux sink should pick up the
+        // slack.
+        std::cerr << "test: ===== idle-source remove (step 4) =====\n";
+        const std::string src4 =
+            "videotestsrc is-live=true pattern=ball ! "
+            "video/x-raw,width=320,height=240,framerate=30/1 ! "
+            "nvvideoconvert";
+        auto* added4 = fnvr::AddSourceToMux(p, mux, src4, "ball-idle");
+        if (!added4) {
+            std::cerr << "test: AddSourceToMux(ball-idle) FAILED\n";
+        } else {
+            std::cerr << "test: added ball-idle source as source_id="
+                      << added4->source_id << " — OK\n";
+            // Immediately force the source to NULL so it stops
+            // emitting buffers — emulates a stalled RTSP source
+            // whose decoder froze.
+            gst_element_set_state(added4->source_bin, GST_STATE_NULL);
+            std::cerr << "test: ball-idle source forced to NULL\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (!fnvr::RemoveSourceFromMux(p, mux, added4)) {
+                std::cerr << "test: RemoveSourceFromMux(ball-idle) reported errors\n";
+            } else {
+                std::cerr << "test: removed ball-idle source — OK\n";
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        // Step 5: a source with deliberately broken caps that
+        // can't reach PLAYING. AddSourceToMux's syncToParent will
+        // log a warning but the source bin is still in the parent
+        // pipeline with a dead link. RemoveSourceFromMux must
+        // clean up without hanging.
+        std::cerr << "test: ===== broken-source remove (step 5) =====\n";
+        const std::string src5 =
+            "videotestsrc is-live=true ! "
+            "video/x-raw,width=99999,height=99999,framerate=30/1 ! "
+            "nvvideoconvert";
+        auto* added5 = fnvr::AddSourceToMux(p, mux, src5, "broken");
+        if (!added5) {
+            std::cerr << "test: AddSourceToMux(broken) FAILED at parse — "
+                         "expected success at parse, would-be source_id "
+                         "would never reach PLAYING\n";
+        } else {
+            std::cerr << "test: added broken source as source_id="
+                      << added5->source_id << " (may not be PLAYING)\n";
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!fnvr::RemoveSourceFromMux(p, mux, added5)) {
+                std::cerr << "test: RemoveSourceFromMux(broken) reported errors\n";
+            } else {
+                std::cerr << "test: removed broken source — OK\n";
+            }
+        }
 
         gst_element_set_state(p, GST_STATE_NULL);
         gst_object_unref(mux);
